@@ -4366,26 +4366,6 @@ def get_next_invoice_number():
         print(f"Using fallback: {fallback_number}")
         return fallback_number, "ICE", 1, type_code
         
-        # # In the chat engine function, add this debug command
-        # if text == "debug type mapping":
-        #     invoice_type = st.session_state.invoice_meta.get("invoice_type")
-        #     type_code = get_type_code(invoice_type)
-            
-        #     response = f"🔍 **Type Mapping Debug:**\n\n"
-        #     response += f"**Current invoice_type in session:** '{invoice_type}'\n"
-        #     response += f"**Mapped type_code:** '{type_code}'\n\n"
-        #     response += "**Available mappings:**\n"
-        #     response += "• 'Purchase Order' → 'PO'\n"
-        #     response += "• 'Sales Invoice' → 'INV'\n"
-        #     response += "• 'Purchase Invoice' → 'PI'\n"
-        #     response += "• 'Credit Note' → 'CN'\n"
-        #     response += "• 'Debit Note' → 'DN'\n"
-        #     response += "• 'Delivery Challan' → 'DCH'\n"
-        #     response += "• 'Proforma Invoice' → 'PINV'\n"
-            
-        #     return response
-        
-        # return f"ICE/{fin_year}/{type_code}/0001", "ICE", 1, type_code
 
 def debug_database_tables():
     """Debug all database tables"""

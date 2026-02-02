@@ -14,10 +14,8 @@
 # # LOAD ENV
 # # =========================
 # load_dotenv()
-
 # OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 # CRM_URL = os.getenv("CRM_URL")
-
 # DB_USER = os.getenv("DB_USER")
 # DB_PASS_RAW = os.getenv("DB_PASSWORD")
 # DB_PASS = quote_plus(DB_PASS_RAW)

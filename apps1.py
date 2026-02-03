@@ -2819,7 +2819,6 @@
 #             response += "\nReply with number (1, 2, 3...)"
             
 #             return response
-        
 #         # In the chat engine, find the INVOICE_TYPE selection part and update it:
 #         elif st.session_state.choice_type == "INVOICE_TYPE":
 #             # Invoice type selected - extract just the base type (before parentheses)
@@ -3979,6 +3978,59 @@ def get_parties():
         print(f"Error in get_parties: {e}")
         return []
 
+def add_product_to_items_table(product_name, price, uom="nos", initial_stock=0):
+    """Add product to items table"""
+    try:
+        with ENGINE.begin() as conn:
+            # Check if product already exists in items table
+            query = text("""
+                SELECT id FROM items 
+                WHERE LOWER(name) = LOWER(:p)
+            """)
+            result = conn.execute(query, {"p": product_name})
+            existing = result.fetchone()
+            
+            if existing:
+                return True, existing[0]  # Return existing product ID
+            
+            # Insert new product to items table
+            insert_query = text("""
+                INSERT INTO items 
+                (name, code, category, type, stock, sellingPrice, purchasePrice, 
+                 gstRate, taxType, measuringUnit, hsnCode, description, asOfDate, lastPurchaseDate)
+                VALUES 
+                (:name, :code, :category, :type, :stock, :selling_price, :purchase_price,
+                 :gst_rate, :tax_type, :measuring_unit, :hsn_code, :description, CURDATE(), CURDATE())
+            """)
+            
+            # Generate code from name
+            code = product_name[:20].replace(' ', '_').upper()
+            
+            conn.execute(insert_query, {
+                "name": product_name,
+                "code": code,
+                "category": "General",
+                "type": "Goods",
+                "stock": str(initial_stock),
+                "selling_price": price,
+                "purchase_price": price * 0.8,  # Default 80% of selling price
+                "gst_rate": "18%",
+                "tax_type": "GST",
+                "measuring_unit": uom,
+                "hsn_code": "999999",
+                "description": product_name
+            })
+            
+            # Get the new product ID
+            query = text("SELECT LAST_INSERT_ID()")
+            result = conn.execute(query)
+            product_id = result.fetchone()[0]
+            
+            return True, product_id
+    except Exception as e:
+        print(f"Error adding product to items table: {e}")
+        return False, None
+
 def get_invoice_types():
     """Get invoice types from database with mappings"""
     try:
@@ -4114,6 +4166,31 @@ def get_product_stock(product_name):
     except Exception as e:
         print(f"Error getting stock for {product_name}: {e}")
         return None
+    
+
+def get_product_uom_from_db(product_name):
+    """Get current UOM from database"""
+    try:
+        with ENGINE.connect() as conn:
+            # First try boq_items
+            query = text("SELECT unit FROM boq_items WHERE LOWER(item_description) = LOWER(:p)")
+            result = conn.execute(query, {"p": product_name})
+            row = result.fetchone()
+            
+            if row and row[0]:
+                return row[0]
+            
+            # Try items table
+            query = text("SELECT measuringUnit FROM items WHERE LOWER(name) = LOWER(:p)")
+            result = conn.execute(query, {"p": product_name})
+            row = result.fetchone()
+            if row and row[0]:
+                return row[0]
+            
+            return None
+    except Exception as e:
+        print(f"Error getting UOM from database: {e}")
+        return None    
 
 def check_product_exists(product_name):
     """Check if product exists in database and return id, price, stock"""
@@ -4149,19 +4226,59 @@ def check_product_exists_simple(product_name):
         print(f"Error checking product (simple): {e}")
         return False, None, None
 
-def add_product_to_db(product_name, price, initial_stock=0):
-    """Add new product to database"""
+def add_product_to_db(product_name, price, initial_stock=0, uom="nos"):
+    """Add new product to BOTH boq_items AND items tables with proper UOM"""
     try:
+        # First add to items table
+        items_success, items_product_id = add_product_to_items_table(
+            product_name, price, uom, initial_stock
+        )
+        
+        if not items_success:
+            return False, "Error adding to items table"
+        
+        # Then add to boq_items table with ALL columns including UOM
         with ENGINE.begin() as conn:
+            # Generate serial number
+            query_last = text("SELECT MAX(serial_number) FROM boq_items")
+            result = conn.execute(query_last)
+            last_serial = result.fetchone()[0]
+            
+            if last_serial and last_serial.isdigit():
+                new_serial = str(int(last_serial) + 1).zfill(3)
+            else:
+                new_serial = "001"
+            
             query = text("""
                 INSERT INTO boq_items 
-                (project_id, item_description, quantity, unit, supply_rate, created_by)
-                VALUES (1, :p, :qty, 'nos', :r, 1)
+                (project_id, serial_number, item_description, quantity, unit, supply_rate, 
+                 supply_amount, total_amount, category, created_by, created_at)
+                VALUES 
+                (:project_id, :serial, :desc, :qty, :unit, :rate, 
+                 :supply_amt, :total_amt, :category, :created_by, NOW())
             """)
-            conn.execute(query, {"p": product_name, "r": price, "qty": initial_stock})
-        return True, "Product added successfully"
+            
+            # Calculate amounts
+            supply_amount = price * initial_stock
+            
+            conn.execute(query, {
+                "project_id": 1,  # Default project
+                "serial": new_serial,
+                "desc": product_name,
+                "qty": initial_stock,
+                "unit": uom,
+                "rate": price,
+                "supply_amt": supply_amount,
+                "total_amt": supply_amount,
+                "category": "General",
+                "created_by": "system"
+            })
+        
+        return True, f"Product '{product_name}' added with UOM: {uom}, Price: ₹{price}, Stock: {initial_stock}"
     except Exception as e:
+        print(f"Error adding product '{product_name}': {e}")
         return False, f"Error adding product: {str(e)}"
+    
 
 def update_product_price(product_name, new_price):
     """Update product price in database"""
@@ -4176,6 +4293,75 @@ def update_product_price(product_name, new_price):
         return True, "Price updated successfully"
     except Exception as e:
         return False, f"Error updating price: {str(e)}"
+    
+def update_invoice_item_uom(product_name, new_uom):
+    """Update UOM in current invoice item"""
+    for item in st.session_state.invoice:
+        if item["item_description"].lower() == product_name.lower():
+            old_uom = item.get("uom", "nos")
+            item["uom"] = new_uom
+            return True, f"✅ UOM updated: {old_uom} → {new_uom}"
+    return False, f"❌ {product_name} not found in invoice"
+
+def update_invoice_item_quantity(product_name, new_quantity):
+    """Update quantity in current invoice item"""
+    for item in st.session_state.invoice:
+        if item["item_description"].lower() == product_name.lower():
+            old_qty = item.get("qty", 0)
+            item["qty"] = new_quantity
+            return True, f"✅ Quantity updated: {old_qty} → {new_quantity}"
+    return False, f"❌ {product_name} not found in invoice"
+
+def update_invoice_item_price(product_name, new_price):
+    """Update price in current invoice item"""
+    for item in st.session_state.invoice:
+        if item["item_description"].lower() == product_name.lower():
+            old_price = item.get("supply_rate", 0)
+            item["supply_rate"] = new_price
+            return True, f"✅ Price updated: ₹{old_price} → ₹{new_price}"
+    return False, f"❌ {product_name} not found in invoice"
+
+def update_product_all(product_name, quantity=None, price=None, uom=None):
+    """Update product in BOTH invoice AND database"""
+    updates = []
+    
+    # Update invoice
+    if quantity is not None:
+        success, msg = update_invoice_item_quantity(product_name, quantity)
+        updates.append(f"Invoice: {msg}")
+    
+    if price is not None:
+        success, msg = update_invoice_item_price(product_name, price)
+        updates.append(f"Invoice: {msg}")
+    
+    if uom is not None:
+        success, msg = update_invoice_item_uom(product_name, uom)
+        updates.append(f"Invoice: {msg}")
+    
+    # Update database
+    if quantity is not None:
+        # Update stock in database
+        current_stock = get_product_stock(product_name)
+        if current_stock is not None:
+            # Calculate difference and update stock
+            # Since we're changing invoice quantity, we need to adjust stock
+            for item in st.session_state.invoice:
+                if item["item_description"].lower() == product_name.lower():
+                    # We already updated invoice quantity above
+                    # Stock adjustment will happen when invoice is saved
+                    pass
+    
+    if price is not None:
+        # Update price in database
+        success, msg = update_product_price(product_name, price)
+        updates.append(f"Database: {msg}")
+    
+    if uom is not None:
+        # Update UOM in database
+        success, msg = update_product_uom(product_name, uom)
+        updates.append(f"Database: {msg}")
+    
+    return "\n".join(updates)    
 
 def remove_product_from_invoice(product_name):
     """Remove product from current invoice"""
@@ -4200,18 +4386,58 @@ def remove_product_from_invoice(product_name):
         return False, f"❌ '{product_name}' not found in current invoice"
 
 def update_product_stock(product_name, new_stock):
-    """Update product stock quantity in database"""
+    """Update product stock quantity in BOTH boq_items AND items tables"""
     try:
         with ENGINE.begin() as conn:
+            # 1. Update boq_items table
             query = text("""
                 UPDATE boq_items 
                 SET quantity = :qty 
                 WHERE LOWER(item_description) = LOWER(:p)
             """)
             conn.execute(query, {"p": product_name, "qty": new_stock})
-        return True, "Stock updated successfully"
+            
+            # 2. Update items table
+            query = text("""
+                UPDATE items 
+                SET stock = :stock,
+                    asOfDate = CURDATE()
+                WHERE LOWER(name) = LOWER(:p)
+            """)
+            conn.execute(query, {"p": product_name, "stock": str(new_stock)})
+            
+        return True, "Stock updated successfully in both tables"
     except Exception as e:
         return False, f"Error updating stock: {str(e)}"
+
+def update_product_price(product_name, new_price):
+    """Update product price in BOTH boq_items AND items tables"""
+    try:
+        with ENGINE.begin() as conn:
+            # 1. Update boq_items table
+            query = text("""
+                UPDATE boq_items 
+                SET supply_rate = :r 
+                WHERE LOWER(item_description) = LOWER(:p)
+            """)
+            conn.execute(query, {"p": product_name, "r": new_price})
+            
+            # 2. Update items table
+            query = text("""
+                UPDATE items 
+                SET sellingPrice = :selling_price,
+                    purchasePrice = :purchase_price
+                WHERE LOWER(name) = LOWER(:p)
+            """)
+            conn.execute(query, {
+                "p": product_name, 
+                "selling_price": new_price,
+                "purchase_price": new_price * 0.8  # 80% of selling price as purchase price
+            })
+            
+        return True, "Price updated successfully in both tables"
+    except Exception as e:
+        return False, f"Error updating price: {str(e)}"
 
 def increase_product_stock(product_name, additional_stock):
     """Increase product stock quantity"""
@@ -4488,6 +4714,8 @@ def debug_search_invoices(search_term=""):
     except Exception as e:
         return f"Error: {e}"
 
+
+
 def debug_invoice_items_table():
     """Debug the invoice_items table structure"""
     try:
@@ -4541,6 +4769,9 @@ def debug_invoice_items_table():
             response += f"{i}. {row}\n"
         
         return response
+    
+
+    
 
 def get_invoice_by_number(invoice_no):
     """Get invoice details by invoice number - searches in invoiceNumber column"""
@@ -4993,7 +5224,7 @@ def get_all_invoices():
         return []
     
 def save_invoice_to_db():
-    """Save invoice to database with all information including GST and update stock"""
+    """Save invoice to database with all information including GST and update stock in BOTH tables"""
     try:
         if not st.session_state.invoice:
             return False, "No items in invoice"
@@ -5055,15 +5286,13 @@ def save_invoice_to_db():
         st.session_state.invoice_meta["invoice_type_code"] = type_code
         
         with ENGINE.begin() as conn:
-            # First check what columns exist in invoices table
-            query = text("SHOW COLUMNS FROM invoices")
-            result = conn.execute(query)
-            invoice_columns = [row[0] for row in result.fetchall()]
-            
             # Insert invoice header
             # Check if invoice_number_generated column exists
-            if 'invoice_number_generated' in invoice_columns:
-                # Use invoice_number_generated column
+            query = text("SHOW COLUMNS FROM invoices LIKE 'invoice_number_generated'")
+            result = conn.execute(query)
+            has_invoice_number_generated = result.fetchone() is not None
+            
+            if has_invoice_number_generated:
                 query = text("""
                     INSERT INTO invoices 
                     (project_id, clientId, type, invoice_number_generated, invoiceNumber, date,
@@ -5072,7 +5301,6 @@ def save_invoice_to_db():
                             :sub, :tax, :total, 'draft', NOW())
                 """)
             else:
-                # Only use invoiceNumber column
                 query = text("""
                     INSERT INTO invoices 
                     (project_id, clientId, type, invoiceNumber, date,
@@ -5091,7 +5319,7 @@ def save_invoice_to_db():
                 "total": gst_calc["grand_total"]
             }
             
-            if 'invoice_number_generated' in invoice_columns:
+            if has_invoice_number_generated:
                 params["no"] = invoice_no
             
             conn.execute(query, params)
@@ -5101,38 +5329,107 @@ def save_invoice_to_db():
             result = conn.execute(query)
             invoice_id = result.fetchone()[0]
             
-            # Update stock for each item
+            # Update stock for each item in BOTH tables
             stock_updates = []
             for item in st.session_state.invoice:
                 product_name = item["item_description"]
                 qty = float(item["qty"])
+                uom = item.get("uom", "nos")  # Get UOM from invoice item
                 
-                # Get current stock
-                current_stock = get_product_stock(product_name)
-                if current_stock is not None:
-                    current_stock = float(current_stock)
-                    if current_stock >= qty:
-                        # Decrease stock
-                        new_stock = current_stock - qty
+                # 1. Update boq_items table with correct UOM
+                current_stock_boq = get_product_stock(product_name)
+                if current_stock_boq is not None:
+                    current_stock_boq = float(current_stock_boq)
+                    if current_stock_boq >= qty:
+                        # Decrease stock in boq_items
+                        new_stock_boq = current_stock_boq - qty
                         update_query = text("""
                             UPDATE boq_items 
-                            SET quantity = :new_qty 
+                            SET quantity = :new_qty,
+                                unit = :uom
                             WHERE LOWER(item_description) = LOWER(:p)
                         """)
-                        conn.execute(update_query, {"p": product_name, "new_qty": new_stock})
-                        stock_updates.append(f"✅ {product_name}: {current_stock} → {new_stock} (reduced by {qty})")
+                        conn.execute(update_query, {"p": product_name, "new_qty": new_stock_boq, "uom": uom})
+                        stock_updates.append(f"✅ **boq_items:** {product_name}: {current_stock_boq} → {new_stock_boq} (UOM: {uom})")
                     else:
-                        stock_updates.append(f"⚠️ {product_name}: Insufficient stock! Available: {current_stock}, Required: {qty}")
-            
-            # Insert invoice items with UOM
+                        stock_updates.append(f"⚠️ **boq_items:** {product_name}: Insufficient stock! Available: {current_stock_boq}, Required: {qty}")
+                else:
+                    # Product not in boq_items, add it
+                    try:
+                        query = text("""
+                            INSERT INTO boq_items 
+                            (project_id, item_description, quantity, unit, supply_rate, created_by)
+                            VALUES (1, :p, 0, :uom, :rate, 1)
+                        """)
+                        conn.execute(query, {"p": product_name, "uom": uom, "rate": item["supply_rate"]})
+                        stock_updates.append(f"➕ **boq_items:** {product_name} added with UOM: {uom}")
+                    except Exception as e:
+                        stock_updates.append(f"❌ **boq_items:** Failed to add {product_name}: {str(e)}")
+                
+                # 2. Update items table with correct UOM
+                try:
+                    # Check if product exists in items table
+                    query = text("SELECT id, stock FROM items WHERE LOWER(name) = LOWER(:p)")
+                    result = conn.execute(query, {"p": product_name})
+                    row = result.fetchone()
+                    
+                    if row:
+                        # Update existing product in items table with UOM
+                        current_stock_items = float(row[1]) if row[1] else 0
+                        new_stock_items = current_stock_items - qty
+                        
+                        # Ensure stock doesn't go negative
+                        if new_stock_items < 0:
+                            new_stock_items = 0
+                        
+                        update_query = text("""
+                            UPDATE items 
+                            SET stock = :new_stock, 
+                                measuringUnit = :uom,
+                                lastPurchaseDate = CURDATE()
+                            WHERE id = :id
+                        """)
+                        conn.execute(update_query, {"id": row[0], "new_stock": str(new_stock_items), "uom": uom})
+                        stock_updates.append(f"✅ **items table:** {product_name}: {current_stock_items} → {new_stock_items} (UOM: {uom})")
+                        
+                        # Use existing product ID for invoice_items
+                        product_id = row[0]
+                    else:
+                        # Add product to items table if not exists
+                        success, product_id = add_product_to_items_table(
+                            product_name, 
+                            float(item["supply_rate"]), 
+                            uom,
+                            0  # Start with 0 stock
+                        )
+                        
+                        if success:
+                            stock_updates.append(f"➕ **items table:** {product_name} added with UOM: {uom}, ID: {product_id}")
+                        else:
+                            product_id = None
+                            stock_updates.append(f"❌ **items table:** Failed to add {product_name}")
+                
+                except Exception as e:
+                    print(f"Error updating items table for {product_name}: {e}")
+                    product_id = None
+                
+            # Insert invoice items with UOM and itemId from items table
             for item in st.session_state.invoice:
                 # Calculate total amount for this item
                 item_total = float(item["qty"]) * float(item["supply_rate"])
                 
-                # Get product ID from boq_items table
-                product_id = get_product_id(item["item_description"])
+                # Get product ID from items table
+                product_id = None
+                try:
+                    query = text("SELECT id FROM items WHERE LOWER(name) = LOWER(:p)")
+                    result = conn.execute(query, {"p": item["item_description"]})
+                    row = result.fetchone()
+                    if row:
+                        product_id = row[0]
+                except Exception as e:
+                    print(f"Error getting product ID from items table: {e}")
                 
-                # Get UOM from item or default to 'nos'
+                # Get UOM from invoice item
                 uom = item.get("uom", "nos")
                 
                 # Insert into invoice_items table with itemId and UOM
@@ -5144,7 +5441,7 @@ def save_invoice_to_db():
                 
                 item_params = {
                     "inv_id": invoice_id,
-                    "item_id": product_id if product_id else None,  # Use None if product not found
+                    "item_id": product_id,  # Use items table product ID
                     "desc": item["item_description"],
                     "uom": uom,
                     "qty": float(item["qty"]),
@@ -5210,33 +5507,37 @@ def extract_product_qty_price(text):
     product = None
     qty = None
     price = None
-    uom = None
+    uom = 'nos'
     
-    # Common UOM patterns
+    # Common UOM patterns with better matching
     uom_patterns = [
-        (r'(\d+)\s*(kg|kilogram|kgs)', 'kg'),
-        (r'(\d+)\s*(g|gram|gm)', 'g'),
-        (r'(\d+)\s*(mg|milligram)', 'mg'),
-        (r'(\d+)\s*(l|liter|litre|lt)', 'l'),
-        (r'(\d+)\s*(ml|milliliter)', 'ml'),
-        (r'(\d+)\s*(m|meter|metre)', 'm'),
-        (r'(\d+)\s*(cm|centimeter)', 'cm'),
-        (r'(\d+)\s*(mm|millimeter)', 'mm'),
-        (r'(\d+)\s*(pcs|pieces|pc|piece|nos|numbers)', 'nos'),
-        (r'(\d+)\s*(box|boxes)', 'box'),
-        (r'(\d+)\s*(pack|packs|packet|packets)', 'pack'),
-        (r'(\d+)\s*(set|sets)', 'set'),
-        (r'(\d+)\s*(roll|rolls)', 'roll'),
-        (r'(\d+)\s*(pair|pairs)', 'pair'),
-        (r'(\d+)\s*(dozen|dozens)', 'dozen'),
-        (r'(\d+)\s*(bundle|bundles)', 'bundle'),
-        (r'(\d+)\s*(carton|cartons)', 'carton'),
-        (r'(\d+)\s*(bag|bags)', 'bag'),
-        (r'(\d+)\s*(tin|tins)', 'tin'),
-        (r'(\d+)\s*(can|cans)', 'can'),
-        (r'(\d+)\s*(bottle|bottles)', 'bottle'),
-        (r'(\d+)\s*(jar|jars)', 'jar'),
-        (r'(\d+)\s*(tube|tubes)', 'tube'),
+        (r'(\d+(?:\.\d+)?)\s*(kg|kilogram|kgs)', 'kg'),
+        (r'(\d+(?:\.\d+)?)\s*(g|gram|gm)', 'g'),
+        (r'(\d+(?:\.\d+)?)\s*(mg|milligram)', 'mg'),
+        (r'(\d+(?:\.\d+)?)\s*(l|liter|litre|lt)', 'l'),
+        (r'(\d+(?:\.\d+)?)\s*(ml|milliliter)', 'ml'),
+        (r'(\d+(?:\.\d+)?)\s*(m|meter|metre)', 'm'),
+        (r'(\d+(?:\.\d+)?)\s*(cm|centimeter)', 'cm'),
+        (r'(\d+(?:\.\d+)?)\s*(mm|millimeter)', 'mm'),
+        (r'(\d+(?:\.\d+)?)\s*(pcs|pieces|pc|piece|nos|numbers|no)', 'nos'),
+        (r'(\d+(?:\.\d+)?)\s*(box|boxes)', 'box'),
+        (r'(\d+(?:\.\d+)?)\s*(pack|packs|packet|packets)', 'pack'),
+        (r'(\d+(?:\.\d+)?)\s*(set|sets)', 'set'),
+        (r'(\d+(?:\.\d+)?)\s*(roll|rolls)', 'roll'),
+        (r'(\d+(?:\.\d+)?)\s*(pair|pairs)', 'pair'),
+        (r'(\d+(?:\.\d+)?)\s*(dozen|dozens)', 'dozen'),
+        (r'(\d+(?:\.\d+)?)\s*(bundle|bundles)', 'bundle'),
+        (r'(\d+(?:\.\d+)?)\s*(carton|cartons)', 'carton'),
+        (r'(\d+(?:\.\d+)?)\s*(bag|bags)', 'bag'),
+        (r'(\d+(?:\.\d+)?)\s*(tin|tins)', 'tin'),
+        (r'(\d+(?:\.\d+)?)\s*(can|cans)', 'can'),
+        (r'(\d+(?:\.\d+)?)\s*(bottle|bottles)', 'bottle'),
+        (r'(\d+(?:\.\d+)?)\s*(jar|jars)', 'jar'),
+        (r'(\d+(?:\.\d+)?)\s*(tube|tubes)', 'tube'),
+        (r'(\d+(?:\.\d+)?)\s*(sqft|square feet|sq\.ft)', 'sqft'),
+        (r'(\d+(?:\.\d+)?)\s*(sqm|square meter|square metre)', 'sqm'),
+        (r'(\d+(?:\.\d+)?)\s*(cubic|cu\.|cft|cubic feet)', 'cft'),
+        (r'(\d+(?:\.\d+)?)\s*(cubic meter|cubic metre|cum)', 'cum'),
     ]
     
     # First check for UOM patterns
@@ -5245,9 +5546,39 @@ def extract_product_qty_price(text):
         if match:
             qty = float(match.group(1))
             uom = unit
-            # Remove the matched pattern from text
+            # Remove the matched pattern from text but keep the number for product name
             text_lower = re.sub(pattern, '', text_lower)
             break
+    
+    # If UOM not found in pattern but product name has UOM hint
+    if not uom:
+        # Check if product name ends with UOM abbreviation
+        uom_hints = {
+            'kg': ['kg', 'kilogram', 'kgs'],
+            'g': ['g', 'gram', 'gm'],
+            'l': ['l', 'liter', 'litre', 'lt'],
+            'ml': ['ml'],
+            'm': ['m', 'meter', 'metre'],
+            'cm': ['cm'],
+            'mm': ['mm'],
+            'nos': ['nos', 'pcs', 'pieces', 'pc', 'piece'],
+            'box': ['box', 'boxes'],
+            'pack': ['pack', 'packet', 'packets'],
+            'sqft': ['sqft', 'square feet'],
+            'sqm': ['sqm', 'square meter', 'square metre'],
+            'cft': ['cft', 'cubic feet'],
+            'cum': ['cum', 'cubic meter', 'cubic metre']
+        }
+        
+        for uom_code, uom_list in uom_hints.items():
+            for hint in uom_list:
+                if f" {hint}" in text_lower or text_lower.endswith(hint):
+                    uom = uom_code
+                    # Remove UOM from product name
+                    text_lower = re.sub(rf'\s*{hint}\b', '', text_lower, flags=re.IGNORECASE)
+                    break
+            if uom:
+                break
     
     # Check for "more" pattern
     more_match = re.search(r'(.+?)\s+(\d+)\s+more', text_lower)
@@ -5388,7 +5719,8 @@ def extract_product_qty_price(text):
             price = float(db_price)
         else:
             price = 0.0  # Default price if not found
-    
+    if uom is None:
+        uom = 'nos'        
     return product, qty, price, uom
 
 def smart_product_match(user_input):
@@ -5397,7 +5729,7 @@ def smart_product_match(user_input):
     if not products:
         return None
     
-    product, _, _ = extract_product_qty_price(user_input)
+    product, qty, price, uom = extract_product_qty_price(user_input)
     
     if product:
         for p in products:
@@ -5494,23 +5826,37 @@ def add_or_update_invoice_item(product_name, qty, price, uom=None):
     except (ValueError, TypeError):
         return "invalid_input", None
     
-    # Get UOM from database if not provided
-    if uom is None:
+    # Initialize uom variable
+    final_uom = None
+    
+    # Use provided uom or get from database
+    if uom is not None and uom != 'nos':
+        final_uom = uom
+    else:
         try:
             with ENGINE.connect() as conn:
+                # First try boq_items
                 query = text("SELECT unit FROM boq_items WHERE LOWER(item_description) = LOWER(:p)")
                 result = conn.execute(query, {"p": product_name})
                 row = result.fetchone()
+                
                 if row and row[0]:
-                    uom = row[0]
+                    final_uom = row[0]
+                else:
+                    # Try items table
+                    query = text("SELECT measuringUnit FROM items WHERE LOWER(name) = LOWER(:p)")
+                    result = conn.execute(query, {"p": product_name})
+                    row = result.fetchone()
+                    if row and row[0]:
+                        final_uom = row[0]
         except Exception as e:
             print(f"Error getting UOM from database: {e}")
     
     # Default UOM if still None
-    if uom is None:
-        uom = 'nos'
+    if final_uom is None:
+        final_uom = 'nos'
     
-    # Check stock availability
+    # Check stock availability from boq_items
     available_stock = get_product_stock(product_name)
     
     if available_stock is not None:
@@ -5545,18 +5891,34 @@ def add_or_update_invoice_item(product_name, qty, price, uom=None):
     # Check if item exists in invoice
     for item in st.session_state.invoice:
         if item["item_description"].lower() == product_name.lower():
-            # Update existing item
+            # Check if UOM has changed
+            old_uom = item.get("uom", "nos")
+            
+            # Update existing item with UOM
             item["qty"] = qty
             item["supply_rate"] = price
-            item["uom"] = uom
+            item["uom"] = final_uom
+            
+            # If UOM changed from what was in database, update database
+            if uom is not None and uom != old_uom and uom != "nos":
+                update_product_uom(product_name, uom)
+                return "updated_with_uom", None
+            
             return "updated", None
     
-    # Add new item with all information
+    # If UOM is provided and different from database UOM, update database
+    if uom is not None and uom != 'nos':
+        # Get current UOM from database
+        db_uom = get_product_uom_from_db(product_name)
+        if db_uom and uom != db_uom:
+            update_product_uom(product_name, uom)
+    
+    # Add new item with all information including UOM
     new_item = {
         "item_description": product_name,
         "qty": qty,
         "supply_rate": price,
-        "uom": uom
+        "uom": final_uom
     }
     
     # Add meta info if available
@@ -5577,8 +5939,47 @@ def add_or_update_invoice_item(product_name, qty, price, uom=None):
     return "added", None
 
 
+def update_product_uom(product_name, new_uom):
+    """Update product UOM in BOTH boq_items AND items tables"""
+    try:
+        with ENGINE.begin() as conn:
+            # 1. Update boq_items table
+            query = text("""
+                UPDATE boq_items 
+                SET unit = :uom 
+                WHERE LOWER(item_description) = LOWER(:p)
+            """)
+            result = conn.execute(query, {"p": product_name, "uom": new_uom})
+            boq_updated = result.rowcount > 0
+            
+            # 2. Update items table
+            query = text("""
+                UPDATE items 
+                SET measuringUnit = :uom
+                WHERE LOWER(name) = LOWER(:p)
+            """)
+            result = conn.execute(query, {"p": product_name, "uom": new_uom})
+            items_updated = result.rowcount > 0
+            
+            if boq_updated or items_updated:
+                return True, f"UOM updated to {new_uom}"
+            else:
+                return False, "Product not found in database"
+            
+    except Exception as e:
+        return False, f"Error updating UOM: {str(e)}"
+
+def update_product_uom_simple(product_name, new_uom):
+    """Simple UOM update without transaction - for use in chat engine"""
+    success, message = update_product_uom(product_name, new_uom)
+    return success, message
+
+
 def chat_engine(user_text):
     text = user_text.lower().strip()
+
+    # Initialize uom variable at the start
+    uom = 'nos'
     
     # Update context
     st.session_state.ai_context.append({"role": "user", "content": user_text})
@@ -5693,7 +6094,330 @@ def chat_engine(user_text):
             return f"❌ Error updating {product} in invoice"
         
         return "❌ Please specify product and quantity. Example: 'increase pen by 5' or 'add 3 more notebook'"
+    # Then when you extract:
+    product, qty, price, extracted_uom = extract_product_qty_price(user_text)
+    if extracted_uom:
+        uom = extracted_uom 
+
+
+    # ===========================================
+    # UPDATE UOM COMMAND
+    # ===========================================
+    if text.startswith("update uom") or text.startswith("change uom"):
+        # Patterns: "update uom pen to kg", "change uom bottle to liter"
+        patterns = [
+            r'(?:update|change)\s+uom\s+(.+?)\s+(?:to|as)\s+(\w+)',
+            r'set\s+(.+?)\s+uom\s+(?:to|as)\s+(\w+)',
+            r'uom\s+(.+?)\s+(?:is|to|as)\s+(\w+)'
+        ]
+        
+        product = None
+        new_uom = None
+        
+        for pattern in patterns:
+            match = re.search(pattern, user_text, re.IGNORECASE)
+            if match:
+                product = match.group(1).strip()
+                new_uom = match.group(2).strip().lower()
+                break
+        
+        # Alternative extraction
+        if not product:
+            words = user_text.lower().split()
+            if "uom" in words:
+                uom_index = words.index("uom")
+                if uom_index + 2 < len(words):
+                    product_words = words[:uom_index]
+                    product = ' '.join(product_words) if product_words else words[uom_index+1]
+                    new_uom = words[-1]
+        
+        if product and new_uom:
+            # Check if product exists in invoice
+            in_invoice = False
+            for item in st.session_state.invoice:
+                if item["item_description"].lower() == product.lower():
+                    in_invoice = True
+                    break
+            
+            if not in_invoice:
+                return f"❌ **{product}** not found in current invoice."
+            
+            # Update in both invoice and database
+            result = update_product_all(product, uom=new_uom)
+            
+            # Show current invoice summary
+            subtotal = 0
+            for item in st.session_state.invoice:
+                qty_val = item.get("qty")
+                price_val = item.get("supply_rate")
+                if qty_val is not None and price_val is not None:
+                    try:
+                        subtotal += float(qty_val) * float(price_val)
+                    except (ValueError, TypeError):
+                        continue
+            
+            response = f"🔄 **UOM Updated Successfully**\n\n"
+            response += f"{result}\n\n"
+            response += f"📋 **Updated Invoice Item:**\n"
+            for item in st.session_state.invoice:
+                if item["item_description"].lower() == product.lower():
+                    response += f"• **{item['item_description']}**: {item['qty']} {item['uom']} × ₹{item['supply_rate']} = ₹{item['qty'] * item['supply_rate']:,.2f}\n"
+            
+            response += f"\n💰 **Invoice Subtotal:** ₹{subtotal:,.2f}"
+            return response
+        
+        return "❌ Please specify product and new UOM. Example: 'update uom bottle to liter' or 'change uom pen to box'"
     
+    # ===========================================
+    # UPDATE QUANTITY COMMAND
+    # ===========================================
+    if text.startswith("update quantity") or text.startswith("change quantity"):
+        # Patterns: "update quantity pen to 20", "change quantity bottle to 50"
+        patterns = [
+            r'(?:update|change)\s+quantity\s+(.+?)\s+(?:to|as)\s+(\d+(?:\.\d+)?)',
+            r'set\s+(.+?)\s+quantity\s+(?:to|as)\s+(\d+(?:\.\d+)?)',
+            r'quantity\s+(.+?)\s+(?:is|to|as)\s+(\d+(?:\.\d+)?)'
+        ]
+        
+        product = None
+        new_qty = None
+        
+        for pattern in patterns:
+            match = re.search(pattern, user_text, re.IGNORECASE)
+            if match:
+                product = match.group(1).strip()
+                new_qty = float(match.group(2))
+                break
+        
+        # Alternative extraction
+        if not product:
+            words = user_text.lower().split()
+            if "quantity" in words:
+                qty_index = words.index("quantity")
+                if qty_index + 2 < len(words):
+                    product_words = words[:qty_index]
+                    product = ' '.join(product_words) if product_words else words[qty_index+1]
+                    # Find number in text
+                    numbers = re.findall(r'\d+(?:\.\d+)?', user_text)
+                    if numbers:
+                        new_qty = float(numbers[0])
+        
+        if product and new_qty:
+            # Check if product exists in invoice
+            in_invoice = False
+            for item in st.session_state.invoice:
+                if item["item_description"].lower() == product.lower():
+                    in_invoice = True
+                    break
+            
+            if not in_invoice:
+                return f"❌ **{product}** not found in current invoice."
+            
+            # Check stock availability if changing to higher quantity
+            current_stock = get_product_stock(product)
+            if current_stock is not None and new_qty > current_stock:
+                return f"❌ **Stock Insufficient!** Only {current_stock} units available for {product}"
+            
+            # Update in both invoice and database
+            result = update_product_all(product, quantity=new_qty)
+            
+            # Show current invoice summary
+            subtotal = 0
+            for item in st.session_state.invoice:
+                qty_val = item.get("qty")
+                price_val = item.get("supply_rate")
+                if qty_val is not None and price_val is not None:
+                    try:
+                        subtotal += float(qty_val) * float(price_val)
+                    except (ValueError, TypeError):
+                        continue
+            
+            response = f"🔄 **Quantity Updated Successfully**\n\n"
+            response += f"{result}\n\n"
+            response += f"📋 **Updated Invoice Item:**\n"
+            for item in st.session_state.invoice:
+                if item["item_description"].lower() == product.lower():
+                    response += f"• **{item['item_description']}**: {item['qty']} {item['uom']} × ₹{item['supply_rate']} = ₹{item['qty'] * item['supply_rate']:,.2f}\n"
+            
+            response += f"\n💰 **Invoice Subtotal:** ₹{subtotal:,.2f}"
+            return response
+        
+        return "❌ Please specify product and new quantity. Example: 'update quantity pen to 20' or 'change quantity bottle to 50'"
+    
+    # ===========================================
+    # UPDATE PRICE COMMAND
+    # ===========================================
+    if text.startswith("update price") or text.startswith("change price"):
+        # Patterns: "update price pen to ₹25", "change price bottle to 50 rs"
+        patterns = [
+            r'(?:update|change)\s+price\s+(.+?)\s+(?:to|as)\s+(?:rs|₹|inr)?\s*(\d+(?:\.\d+)?)',
+            r'set\s+(.+?)\s+price\s+(?:to|as)\s+(?:rs|₹|inr)?\s*(\d+(?:\.\d+)?)',
+            r'price\s+(.+?)\s+(?:is|to|as)\s+(?:rs|₹|inr)?\s*(\d+(?:\.\d+)?)'
+        ]
+        
+        product = None
+        new_price = None
+        
+        for pattern in patterns:
+            match = re.search(pattern, user_text, re.IGNORECASE)
+            if match:
+                product = match.group(1).strip()
+                new_price = float(match.group(2))
+                break
+        
+        # Alternative extraction
+        if not product:
+            words = user_text.lower().split()
+            if "price" in words:
+                price_index = words.index("price")
+                if price_index + 2 < len(words):
+                    product_words = words[:price_index]
+                    product = ' '.join(product_words) if product_words else words[price_index+1]
+                    # Find price in text
+                    numbers = re.findall(r'\d+(?:\.\d+)?', user_text)
+                    if numbers:
+                        new_price = float(numbers[0])
+        
+        if product and new_price:
+            # Check if product exists in invoice
+            in_invoice = False
+            for item in st.session_state.invoice:
+                if item["item_description"].lower() == product.lower():
+                    in_invoice = True
+                    break
+            
+            if not in_invoice:
+                return f"❌ **{product}** not found in current invoice."
+            
+            # Get current database price for comparison
+            exists, db_price, stock = check_product_exists_simple(product)
+            
+            # Update in both invoice and database
+            result = update_product_all(product, price=new_price)
+            
+            # Show price comparison if available
+            price_info = ""
+            if exists and db_price:
+                price_diff = ((new_price - db_price) / db_price) * 100
+                if price_diff > 0:
+                    price_info = f"\n📈 **Price increased by {price_diff:.1f}%** (from ₹{db_price})"
+                elif price_diff < 0:
+                    price_info = f"\n📉 **Price decreased by {abs(price_diff):.1f}%** (from ₹{db_price})"
+                else:
+                    price_info = f"\n✅ **Price unchanged** (₹{db_price})"
+            
+            # Show current invoice summary
+            subtotal = 0
+            for item in st.session_state.invoice:
+                qty_val = item.get("qty")
+                price_val = item.get("supply_rate")
+                if qty_val is not None and price_val is not None:
+                    try:
+                        subtotal += float(qty_val) * float(price_val)
+                    except (ValueError, TypeError):
+                        continue
+            
+            response = f"💰 **Price Updated Successfully**\n\n"
+            response += f"{result}{price_info}\n\n"
+            response += f"📋 **Updated Invoice Item:**\n"
+            for item in st.session_state.invoice:
+                if item["item_description"].lower() == product.lower():
+                    response += f"• **{item['item_description']}**: {item['qty']} {item['uom']} × ₹{item['supply_rate']} = ₹{item['qty'] * item['supply_rate']:,.2f}\n"
+            
+            response += f"\n💰 **Invoice Subtotal:** ₹{subtotal:,.2f}"
+            return response
+        
+        return "❌ Please specify product and new price. Example: 'update price pen to ₹25' or 'change price bottle to 50'"
+    
+    # ===========================================
+    # UPDATE ALL COMMAND - UPDATE QUANTITY, PRICE, UOM TOGETHER
+    # ===========================================
+    if text.startswith("update all") or text.startswith("change all"):
+        # Pattern: "update all pen to 20 pieces at ₹30"
+        patterns = [
+            r'(?:update|change)\s+all\s+(.+?)\s+to\s+(\d+(?:\.\d+)?)\s+(\w+)\s+(?:at|for)\s+(?:rs|₹|inr)?\s*(\d+(?:\.\d+)?)',
+            r'set\s+(.+?)\s+as\s+(\d+(?:\.\d+)?)\s+(\w+)\s+at\s+(?:rs|₹|inr)?\s*(\d+(?:\.\d+)?)'
+        ]
+        
+        product = None
+        new_qty = None
+        new_uom = None
+        new_price = None
+        
+        for pattern in patterns:
+            match = re.search(pattern, user_text, re.IGNORECASE)
+            if match:
+                product = match.group(1).strip()
+                new_qty = float(match.group(2))
+                new_uom = match.group(3).strip().lower()
+                new_price = float(match.group(4))
+                break
+        
+        # Alternative extraction - try to extract each component separately
+        if not product:
+            # Extract quantity
+            qty_match = re.search(r'(\d+(?:\.\d+)?)\s+(\w+)\s+(?:at|for|@)\s+(?:rs|₹|inr)?\s*(\d+(?:\.\d+)?)', user_text, re.IGNORECASE)
+            if qty_match:
+                new_qty = float(qty_match.group(1))
+                new_uom = qty_match.group(2).lower()
+                new_price = float(qty_match.group(3))
+                
+                # Extract product name (everything before the quantity)
+                product_text = user_text[:qty_match.start()].strip()
+                # Remove command words
+                product_text = re.sub(r'^(?:update|change|set)\s+all\s+', '', product_text, flags=re.IGNORECASE)
+                product_text = re.sub(r'^(?:to|as)\s+', '', product_text, flags=re.IGNORECASE)
+                product = product_text.strip()
+        
+        if product and new_qty and new_uom and new_price:
+            # Check if product exists in invoice
+            in_invoice = False
+            for item in st.session_state.invoice:
+                if item["item_description"].lower() == product.lower():
+                    in_invoice = True
+                    break
+            
+            if not in_invoice:
+                return f"❌ **{product}** not found in current invoice."
+            
+            # Check stock if increasing quantity
+            current_stock = get_product_stock(product)
+            if current_stock is not None and new_qty > current_stock:
+                return f"❌ **Stock Insufficient!** Only {current_stock} units available for {product}"
+            
+            # Update everything
+            result = update_product_all(product, quantity=new_qty, price=new_price, uom=new_uom)
+            
+            # Show current invoice summary
+            subtotal = 0
+            for item in st.session_state.invoice:
+                qty_val = item.get("qty")
+                price_val = item.get("supply_rate")
+                if qty_val is not None and price_val is not None:
+                    try:
+                        subtotal += float(qty_val) * float(price_val)
+                    except (ValueError, TypeError):
+                        continue
+            
+            response = f"🔄 **Complete Update Successful**\n\n"
+            response += f"**{product}** updated:\n"
+            response += f"• Quantity: → {new_qty}\n"
+            response += f"• UOM: → {new_uom}\n"
+            response += f"• Price: ₹ → ₹{new_price}\n\n"
+            response += f"📋 **Updated Invoice Item:**\n"
+            for item in st.session_state.invoice:
+                if item["item_description"].lower() == product.lower():
+                    response += f"• **{item['item_description']}**: {item['qty']} {item['uom']} × ₹{item['supply_rate']} = ₹{item['qty'] * item['supply_rate']:,.2f}\n"
+            
+            response += f"\n💰 **Invoice Subtotal:** ₹{subtotal:,.2f}"
+            return response
+        
+        return "❌ Please specify all details. Example: 'update all pen to 20 pieces at ₹30' or 'set pen as 10 kg at ₹500'"   
+
+    
+
+
+
     # ===========================================
     # NEW: DELETE ROW COMMAND
     # ===========================================
@@ -6212,6 +6936,7 @@ def chat_engine(user_text):
                 return f"❌ **Stock Insufficient!** Only {stock_info} units available for {p['product']}"
             elif action == "updated":
                 total_qty = sum(item['qty'] for item in st.session_state.invoice 
+
                             if item['item_description'].lower() == p["product"].lower())
                 return f"✅ Added {p['qty']} {p['product']} at **database price ₹{p['db_price']}**. Total now {total_qty}"
             else:
@@ -6220,6 +6945,63 @@ def chat_engine(user_text):
         else:
             st.session_state.chat_stage = None
             return "❌ Using database price."
+        
+    # Check if UOM is specified and different from database
+    current_uom = uom if 'uom' in locals() and uom else 'nos'
+
+    if 'uom' in locals() and uom and uom != 'nos':
+        # Get current UOM from database
+        db_uom = get_product_uom_from_db(product)
+        
+        # If UOM is different, ask for confirmation
+        if db_uom and current_uom.lower() != db_uom.lower():
+            st.session_state.pending_data = {
+                "product": product,
+                "qty": qty,
+                "price": price_float,
+                "old_uom": db_uom,
+                "new_uom": current_uom,
+                "db_price": db_price_float
+            }
+            st.session_state.chat_stage = "CONFIRM_UOM_CHANGE"
+            
+            response = f"⚠️ **UOM Mismatch Detected!**\n"
+            response += f"Database shows UOM as: **{db_uom}**\n"
+            response += f"You mentioned: **{current_uom}**\n\n"
+            response += f"Update UOM from {db_uom} to {current_uom}? (yes/no)"
+            return response
+
+    if st.session_state.chat_stage == "CONFIRM_UOM_CHANGE":
+        if text in ["yes", "y", "ok", "update"]:
+            p = st.session_state.pending_data
+            # Update UOM in database
+            success, message = update_product_uom_simple(p["product"], p["new_uom"])
+            
+            # Add product to invoice
+            action, stock_info = add_or_update_invoice_item(p["product"], p["qty"], p["price"], p["new_uom"])
+            
+            st.session_state.chat_stage = None
+            
+            if action == "stock_insufficient":
+                return f"✅ **UOM updated to {p['new_uom']}**\n❌ **Stock Insufficient!** Only {stock_info} units available"
+            else:
+                return f"✅ **UOM updated to {p['new_uom']}**\n✅ Added {p['qty']} {p['product']} at ₹{p['price']}"
+        
+        elif text in ["no", "n", "cancel", "use old"]:
+            p = st.session_state.pending_data
+            # Use old UOM
+            action, stock_info = add_or_update_invoice_item(p["product"], p["qty"], p["price"], p["old_uom"])
+            
+            st.session_state.chat_stage = None
+            
+            if action == "stock_insufficient":
+                return f"❌ **Stock Insufficient!** Only {stock_info} units available"
+            else:
+                return f"✅ Using old UOM ({p['old_uom']})\n✅ Added {p['qty']} {p['product']} at ₹{p['price']}"
+        
+        else:
+            st.session_state.chat_stage = None
+            return "❌ Using database UOM."       
     
     # ===========================================
     # EXISTING FUNCTIONALITY (REST OF THE CHAT ENGINE)
@@ -6837,8 +7619,20 @@ def chat_engine(user_text):
             if "stock" not in p:
                 st.session_state.pending_data["stock"] = 0
                 st.session_state.chat_stage = "ASK_INITIAL_STOCK"
-                return f"How much initial stock for **{p['product']}**? (Enter 0 if no stock)"
-        
+                
+                uom_info = f" ({p.get('uom', 'nos')})" if p.get("uom", "nos") != "nos" else ""
+                
+                response = f"📦 **Set Initial Stock for {p['product']}{uom_info}**\n\n"
+                response += f"**Requested:** {p.get('qty', 0)} {p['product']} at ₹{p.get('price', 0)} each\n\n"
+                response += "**How much initial stock to add to database?**\n"
+                response += "• Enter number (e.g., '100')\n"
+                response += "• Say '100piece' or '100kg'\n"
+                response += "• Say 'add stock by 100'\n"
+                response += "• Say '0' or 'no stock' for zero stock\n\n"
+                response += f"**Example:** 'add stock {p['product']} by 100{p.get('uom', '')}'"
+                
+                return response
+            
         elif text in ["no", "cancel", "n"]:
             st.session_state.chat_stage = None
             return "❌ Product addition cancelled."
@@ -6846,31 +7640,103 @@ def chat_engine(user_text):
     # ASK INITIAL STOCK FOR NEW PRODUCT
     if st.session_state.chat_stage == "ASK_INITIAL_STOCK":
         stock = None
-        numbers = re.findall(r'\d+', text)
-        if numbers:
-            stock = int(numbers[0])
-        
-        if stock is None:
-            return "Please enter a valid stock quantity (numbers only)"
+        stock_uom = None
         
         p = st.session_state.pending_data
-        success, message = add_product_to_db(p["product"], p["price"], stock)
+        product_name = p["product"]
+        uom = p.get("uom", "nos")
+        price = p["price"]
+        qty = p["qty"]
+        
+        # Extract stock quantity and UOM from user input
+        text_lower = text.lower()
+        
+        # Check for patterns like "add stock cat by 100piece" or "100piece"
+        patterns = [
+            r'add stock\s+(?:by\s+)?(\d+)(?:\s*(\w+))?',
+            r'(\d+)\s*(kg|g|l|ml|m|cm|mm|piece|pieces|pc|pcs|nos|box|pack|set|roll|pair|dozen|bundle|carton|bag|tin|can|bottle|jar|tube|sqft|sqm|cft|cum)\b',
+            r'by\s+(\d+)(?:\s*(\w+))?',
+            r'(\d+)(?:\s*more|\s*additional|\s*extra)?'
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, text_lower)
+            if match:
+                if len(match.groups()) >= 1:
+                    stock = int(match.group(1))
+                    if len(match.groups()) >= 2 and match.group(2):
+                        stock_uom = match.group(2)
+                break
+        
+        # If no stock mentioned in command, look for numbers
+        if stock is None:
+            numbers = re.findall(r'\d+', text)
+            if numbers:
+                stock = int(numbers[0])
+        
+        # Handle special cases
+        if stock is None:
+            if text_lower in ["yes", "y", "ok", "okay", "confirm", "zero", "0", "none", "no stock"]:
+                stock = 0
+            elif text_lower in ["add", "add it", "add product"]:
+                # User just said "add", use default stock
+                stock = 0
+            else:
+                # Try to extract just the number
+                words = text.split()
+                for word in words:
+                    if word.isdigit():
+                        stock = int(word)
+                        break
+        
+        # Default to 0 if still None
+        if stock is None:
+            stock = 0
+        
+        # Use the UOM from pending data if not specified in stock command
+        if stock_uom is None:
+            stock_uom = uom
+        
+        # Now add the product to database with stock
+        success, message = add_product_to_db(product_name, price, stock, uom)
         st.session_state.chat_stage = None
         
         if success:
-            # Add the product to invoice with the requested quantity
-            action, stock_info = add_or_update_invoice_item(p["product"], p["qty"], p["price"])
+            # Add the product to invoice with the originally requested quantity
+            action, stock_info = add_or_update_invoice_item(product_name, qty, price, uom)
             
-            if action == "stock_insufficient":
-                return f"✅ **{p['product']}** added to database at ₹{p['price']} with {stock} stock\n\n❌ **Stock Insufficient!** Only {stock_info} units available for {p['product']}"
-            elif action == "updated":
-                total_qty = sum(item['qty'] for item in st.session_state.invoice 
-                              if item['item_description'].lower() == p["product"].lower())
-                return f"✅ **{p['product']}** added to database at ₹{p['price']} with {stock} stock\n✅ Quantity increased by {p['qty']}. Total now {total_qty}"
-            else:
-                return f"✅ **{p['product']}** added to database at ₹{p['price']} with {stock} stock\n✅ Added {p['qty']} {p['product']} to invoice"
+            # Get updated invoice subtotal
+            subtotal = 0
+            for item in st.session_state.invoice:
+                qty_val = item.get("qty")
+                price_val = item.get("supply_rate")
+                if qty_val is not None and price_val is not None:
+                    try:
+                        subtotal += float(qty_val) * float(price_val)
+                    except (ValueError, TypeError):
+                        continue
+            
+            # Calculate item total
+            item_total = qty * price
+            
+            response = f"✅ **{product_name}** added to database at ₹{price} with {stock} {uom} stock\n\n"
+            response += f"📦 **Added to Invoice:** {qty} {product_name} ({uom}) × ₹{price} = ₹{item_total:,.2f}\n"
+            response += f"💰 **Invoice Subtotal:** ₹{subtotal:,.2f}\n"
+            response += f"📊 **Available Stock:** {stock} {uom} (after adding {stock} {uom})\n\n"
+            
+            # Show current invoice items
+            if st.session_state.invoice:
+                response += "**Current Invoice Items:**\n"
+                for i, item in enumerate(st.session_state.invoice, 1):
+                    item_qty = item.get("qty", 0)
+                    item_price = item.get("supply_rate", 0)
+                    item_uom = item.get("uom", "nos")
+                    item_total = item_qty * item_price
+                    response += f"{i}. {item['item_description']} - {item_qty} {item_uom} × ₹{item_price:,.2f} = ₹{item_total:,.2f}\n"
+            
+            return response
         else:
-            return f"❌ {message}"
+            return f"❌ Error adding product: {message}"
     
     # ASK QUANTITY
     if st.session_state.chat_stage == "ASK_QTY":
@@ -6950,22 +7816,53 @@ def chat_engine(user_text):
             st.session_state.ai_context.append({"role": "assistant", "content": ai_response})
             return ai_response
     
-    # REGULAR PRODUCT ORDER (only if setup is complete)
-    # REGULAR PRODUCT ORDER (only if setup is complete)
-    product, qty, price, uom = extract_product_qty_price(user_text)
+    # After extracting product, qty, price, uom
+    # Extract with safe unpacking
+    result = extract_product_qty_price(user_text)
+    if len(result) == 4:
+        product, qty, price, uom = result
+    else:
+        # Handle case where function returns fewer values
+        product, qty, price = result if len(result) == 3 else (result[0], result[1], result[2] if len(result) > 2 else None)
+        uom = 'nos'  # Default value
 
     if not product:
         product = smart_product_match(user_text)
 
-    if not product:
-        ai_response = get_ai_response(user_text, st.session_state.ai_context)
-        st.session_state.ai_context.append({"role": "assistant", "content": ai_response})
-        return ai_response
+    # Ensure uom variable is defined
+    if 'uom' not in locals() or uom is None:
+        uom = 'nos'
 
-    # Clean product name
-    product = re.sub(r'\s*(?:rs|₹|inr|\d+)$', '', product, flags=re.IGNORECASE).strip()
+    # Clean product name - remove UOM from product name if present
+    product = product.strip()
 
-    exists, db_price, stock = check_product_exists_simple(product)
+    # If UOM was extracted and is part of product name, remove it
+    if uom and uom != 'nos':
+        # Remove common UOM patterns from product name
+        uom_patterns = {
+            'kg': ['kg', 'kilogram', 'kgs'],
+            'g': ['g', 'gram', 'gm'],
+            'l': ['l', 'liter', 'litre', 'lt'],
+            'ml': ['ml'],
+            'm': ['m', 'meter', 'metre'],
+            'cm': ['cm'],
+            'mm': ['mm'],
+            'nos': ['nos', 'pcs', 'pieces', 'pc', 'piece', 'no'],
+            'box': ['box', 'boxes'],
+            'pack': ['pack', 'packet', 'packets'],
+            'sqft': ['sqft', 'square feet', 'sq.ft'],
+            'sqm': ['sqm', 'square meter', 'square metre'],
+            'cft': ['cft', 'cubic feet'],
+            'cum': ['cum', 'cubic meter', 'cubic metre']
+        }
+        
+        if uom in uom_patterns:
+            for uom_word in uom_patterns[uom]:
+                # Remove UOM word from end of product name
+                if product.lower().endswith(f" {uom_word}"):
+                    product = product[:-len(f" {uom_word}")].strip()
+                elif product.lower().endswith(uom_word):
+                    product = product[:-len(uom_word)].strip()
 
     # Convert price to float if it exists
     price_float = None
@@ -6986,19 +7883,28 @@ def chat_engine(user_text):
             st.session_state.pending_data = {"product": product, "qty": qty}
             return f"Price for {qty} {product}?"
         
-        st.session_state.pending_data = {"product": product, "qty": qty, "price": price_float}
+        # Include UOM in pending data
+        st.session_state.pending_data = {
+            "product": product, 
+            "qty": qty, 
+            "price": price_float,
+            "uom": uom  # ADD THIS LINE
+        }
         st.session_state.chat_stage = "ADD"
-        return f"**{product}** not in database. Add it with price ₹{price_float}?"
+        
+        # Include UOM in the message
+        uom_info = f" ({uom})" if uom != "nos" else ""
+        return f"**{product}** not in database. Add it with price ₹{price_float}{uom_info}?"
 
     if qty is None:
         st.session_state.chat_stage = "ASK_QTY"
-        st.session_state.pending_data = {"product": product}
-        return f"How many **{product}**? (Database price: ₹{db_price}, Stock: {stock if stock is not None else 'N/A'})"
-
-    if price_float is None:
+        st.session_state.pending_data = {"product": product, "uom": uom}
+        return f"How many **{product}**? (Database price: ₹{db_price}, Stock: {stock if stock is not None else 'N/A'}, UOM: {uom})"
+    
+    if price is None:
         st.session_state.chat_stage = "ASK_PRICE"
-        st.session_state.pending_data = {"product": product, "qty": qty}
-        return f"Price for {qty} {product}? (Database price: ₹{db_price}, Stock: {stock if stock is not None else 'N/A'})"
+        st.session_state.pending_data = {"product": product, "qty": qty, "uom": uom}
+        return f"Price for {qty} {product}? (Database price: ₹{db_price}, Stock: {stock if stock is not None else 'N/A'}, UOM: {uom})"
 
     # Convert db_price to float for comparison
     db_price_float = None
@@ -7052,7 +7958,15 @@ def chat_engine(user_text):
                 "update_db": False
             }
             st.session_state.chat_stage = "CONFIRM_HIGH_PRICE"
-            return f"💰 **Higher Price Detected!**\nDatabase price: ₹{db_price_float}\nYour price: ₹{price_float}\n({price_diff:.1f}% higher)\n\nDo you want to:\n1. Use higher price? (Type 'yes')\n2. Use database price? (Type 'no')\n3. Update database to new price? (Type 'update')"
+            response = f"📈 **Note: Higher Price Mentioned**\n"
+            response += f"You mentioned **{product}** at ₹{price_float:,.2f}\n"
+            response += f"Database price: ₹{db_price_float:,.2f}\n"
+            response += f"({price_diff:.1f}% higher)\n\n"
+            response += "Update database to new price? (update/use db)"
+            st.session_state.chat_stage = "PRICE_ALERT_SMALL_HIGH"
+        
+        return response
+
 
     # If prices are equal or db_price_float is None, proceed with adding item
     # Check stock before adding
@@ -7700,6 +8614,61 @@ elif st.session_state.invoice:
             else:
                 st.error(f"❌ {message}")
 
+
+def debug_items_table():
+    """Debug the items table structure and data"""
+    try:
+        with ENGINE.connect() as conn:
+            # Check if table exists
+            query = text("SHOW TABLES LIKE 'items'")
+            result = conn.execute(query)
+            if not result.fetchone():
+                return "❌ items table does not exist"
+            
+            # Get table structure
+            query = text("SHOW COLUMNS FROM items")
+            result = conn.execute(query)
+            columns = []
+            for row in result.fetchall():
+                columns.append({
+                    "field": row[0],
+                    "type": row[1],
+                    "null": row[2],
+                    "key": row[3],
+                    "default": row[4],
+                    "extra": row[5]
+                })
+            
+            # Get sample data
+            query = text("SELECT id, name, code, stock, sellingPrice, purchasePrice, measuringUnit FROM items LIMIT 10")
+            result = conn.execute(query)
+            sample_data = result.fetchall()
+            
+            return {
+                "columns": columns,
+                "sample_data": sample_data
+            }
+    except Exception as e:
+        return f"Error: {e}"
+
+    # Add this debug command to chat engine
+    # In chat_engine function, add:
+    if text == "debug items":
+        debug_info = debug_items_table()
+        if isinstance(debug_info, str):
+            return debug_info
+        
+        response = "🔍 **items Table Structure:**\n\n"
+        response += "**Columns:**\n"
+        for col in debug_info["columns"]:
+            response += f"• {col['field']} ({col['type']}) - Null: {col['null']}\n"
+        
+        response += "\n**Sample Data (first 10 products):**\n"
+        for i, row in enumerate(debug_info["sample_data"], 1):
+            response += f"{i}. ID:{row[0]} | Name:'{row[1]}' | Code:'{row[2]}' | Stock:{row[3]} | Selling:₹{row[4]} | Purchase:₹{row[5]} | Unit:{row[6]}\n"
+        
+        return response                
+
 # Initial greeting
 if not st.session_state.messages:
     with st.chat_message("assistant"):
@@ -7780,6 +8749,11 @@ if not st.session_state.messages:
         greeting += "• 'Add 5 boxes of screws at ₹200' → Extracts UOM (boxes)\n"
         greeting += "• 'Update pen quantity to 15' → Updates invoice and database\n"
         greeting += "• 'Change screwdriver price to ₹75' → Updates price in both\n\n"
+        greeting += "**🔄 Update Commands for Current Invoice:**\n"
+        greeting += "• '**update uom bottle to liter**' - Change UOM in invoice & database\n"
+        greeting += "• '**update quantity pen to 20**' - Change quantity in invoice & check stock\n"
+        greeting += "• '**update price screwdriver to ₹75**' - Change price in invoice & database\n"
+        greeting += "• '**update all pen to 20 pieces at ₹30**' - Update all at once\n\n"
         
         st.markdown(greeting)
         st.session_state.messages.append({

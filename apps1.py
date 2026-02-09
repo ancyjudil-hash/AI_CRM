@@ -3680,7 +3680,7 @@ from reportlab.pdfgen import canvas
 from reportlab.lib.utils import ImageReader
 import io
 import csv
-import io
+
 
 
 # =========================
@@ -3758,7 +3758,10 @@ defaults = {
     "old_invoice_data": None,
     "stock_alert": [],
     "product_suggestions": [],
-    "last_product_search": ""
+    "last_product_search": "",
+    "change_history": [],
+    "last_suggestions": [],
+    "quick_action_product": None
 }
 
 for k, v in defaults.items():
@@ -3872,6 +3875,160 @@ def get_product_suggestions(search_term):
         print(f"Error getting product suggestions: {e}")
         return []
     
+
+
+# ===========================================
+# HISTORY TRACKING FUNCTIONS
+# ===========================================
+
+def save_to_history(action_type, product, old_value, new_value, additional_info=None):
+    """Save change to history for undo functionality"""
+    history_entry = {
+        "timestamp": datetime.now(),
+        "type": action_type,
+        "product": product,
+        "old": old_value,
+        "new": new_value,
+        "additional_info": additional_info
+    }
+    
+    st.session_state.change_history.append(history_entry)
+    
+    # Keep only last 20 changes
+    if len(st.session_state.change_history) > 20:
+        st.session_state.change_history = st.session_state.change_history[-20:]
+    
+    return history_entry
+
+def undo_last_change():
+    """Undo the last change from history"""
+    if not st.session_state.change_history:
+        return None, "❌ No changes to undo"
+    
+    last_change = st.session_state.change_history.pop()
+    
+    product = last_change["product"]
+    change_type = last_change["type"]
+    old_value = last_change["old"]
+    
+    # Apply undo based on change type
+    if change_type == "price":
+        # Restore old price
+        for item in st.session_state.invoice:
+            if item["item_description"].lower() == product.lower():
+                item["supply_rate"] = old_value
+                break
+        
+        # Update database
+        update_product_price(product, old_value)
+        
+        return product, f"↩️ **Price Undo:** {product}\n₹{last_change['new']} → ₹{old_value}"
+    
+    elif change_type == "quantity":
+        # Restore old quantity
+        for item in st.session_state.invoice:
+            if item["item_description"].lower() == product.lower():
+                item["qty"] = old_value
+                break
+        
+        return product, f"↩️ **Quantity Undo:** {product}\n{last_change['new']} → {old_value}"
+    
+    elif change_type == "uom":
+        # Restore old UOM
+        for item in st.session_state.invoice:
+            if item["item_description"].lower() == product.lower():
+                item["uom"] = old_value
+                break
+        
+        # Update database
+        update_product_uom(product, old_value)
+        
+        return product, f"↩️ **UOM Undo:** {product}\n{last_change['new']} → {old_value}"
+    
+    elif change_type == "product_added":
+        # Remove the product from invoice
+        new_invoice = []
+        for item in st.session_state.invoice:
+            if item["item_description"].lower() != product.lower():
+                new_invoice.append(item)
+        
+        st.session_state.invoice = new_invoice
+        
+        return product, f"↩️ **Product Removed:** {product}\n(Undo addition)"
+    
+    elif change_type == "product_removed":
+        # Re-add the product (need more info in history)
+        if last_change["additional_info"]:
+            item_data = last_change["additional_info"]
+            st.session_state.invoice.append(item_data)
+            
+            return product, f"↩️ **Product Restored:** {product}\n(Undo removal)"
+    
+    return None, f"↩️ **Undo:** {change_type} for {product}"
+
+# ===========================================
+# UPDATE FUNCTIONS WITH HISTORY TRACKING
+# ===========================================
+
+def update_product_all_with_history(product_name, quantity=None, price=None, uom=None):
+    """Update product in BOTH invoice AND database with history tracking"""
+    updates = []
+    history_entries = []
+    
+    # Get current values before update
+    current_item = None
+    for item in st.session_state.invoice:
+        if item["item_description"].lower() == product_name.lower():
+            current_item = item
+            break
+    
+    if not current_item:
+        return [f"❌ {product_name} not found in invoice"]
+    
+    # Update QUANTITY with history
+    if quantity is not None:
+        old_qty = current_item.get("qty", 0)
+        if old_qty != quantity:
+            save_to_history("quantity", product_name, old_qty, quantity)
+            success, msg = update_invoice_item_quantity(product_name, quantity)
+            updates.append(f"📦 Quantity: {old_qty} → {quantity}")
+    
+    # Update PRICE with history
+    if price is not None:
+        old_price = current_item.get("supply_rate", 0)
+        if old_price != price:
+            save_to_history("price", product_name, old_price, price)
+            success, msg = update_invoice_item_price(product_name, price)
+            # Update database
+            update_product_price(product_name, price)
+            updates.append(f"💰 Price: ₹{old_price} → ₹{price}")
+    
+    # Update UOM with history
+    if uom is not None:
+        old_uom = current_item.get("uom", "nos")
+        if old_uom != uom:
+            save_to_history("uom", product_name, old_uom, uom)
+            success, msg = update_invoice_item_uom(product_name, uom)
+            # Update database
+            update_product_uom(product_name, uom)
+            updates.append(f"📏 UOM: {old_uom} → {uom}")
+    
+    return updates
+
+# Also update the add_to_invoice function to track additions:
+def add_to_invoice_with_history(product_name, qty, price, uom="nos"):
+    """Add product to invoice with history tracking"""
+    # Save current state for undo
+    save_to_history("product_added", product_name, None, qty, {
+        "action": "add",
+        "qty": qty,
+        "price": price,
+        "uom": uom
+    })
+    
+    # Add to invoice
+    action, stock_info = add_or_update_invoice_item(product_name, qty, price, uom)
+    return action, stock_info    
 
     # =========================
     # DATABASE FUNCTIONS - STOCK MANAGEMENT
@@ -4030,6 +4187,58 @@ def add_product_to_items_table(product_name, price, uom="nos", initial_stock=0):
     except Exception as e:
         print(f"Error adding product to items table: {e}")
         return False, None
+
+def analyze_conversation_with_ai(user_input, conversation_history):
+    """Use AI to analyze the conversation and suggest actions"""
+    if not client:
+        return None
+    
+    system_prompt = """Analyze the user's conversation about invoices and suggest:
+    1. What action the user likely wants (add product, create invoice, check stock, etc.)
+    2. If there's any missing information
+    3. Potential next steps
+    
+    Return as JSON: {"action": "string", "missing_info": ["list"], "suggestions": ["list"]}"""
+    
+    messages = [
+        {"role": "system", "content": system_prompt},
+        *conversation_history[-4:],
+        {"role": "user", "content": user_input}
+    ]
+    
+    try:
+        response = client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=messages,
+            response_format={"type": "json_object"},
+            max_tokens=150,
+            temperature=0.3
+        )
+        return json.loads(response.choices[0].message.content)
+    except:
+        return None
+
+def get_product_description_with_ai(product_name):
+    """Generate product description using AI"""
+    if not client:
+        return product_name
+    
+    prompt = f"""Generate a concise product description for '{product_name}' that would be suitable for an invoice.
+    Keep it under 50 words. Focus on key features."""
+    
+    try:
+        response = client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": "You are a product description assistant."},
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=60,
+            temperature=0.5
+        )
+        return response.choices[0].message.content.strip()
+    except:
+        return product_name
 
 def get_invoice_types():
     """Get invoice types from database with mappings"""
@@ -5743,8 +5952,9 @@ def smart_product_match(user_input):
     return product
 
 def get_ai_response(user_message, context_history):
-    """Get AI response"""
+    """Get AI response with invoice-specific context"""
     if not client:
+        # Fallback to simple responses
         user_lower = user_message.lower()
         if any(word in user_lower for word in ["hi", "hello", "hey"]):
             return "Hello! How can I help you today?"
@@ -5755,42 +5965,89 @@ def get_ai_response(user_message, context_history):
         else:
             return "I can help you with invoices. What do you need?"
     
+    # Get current context
     projects = get_projects()
     parties = get_parties()
     products = get_product_options()
     
-    system_prompt = f"""You are a helpful invoice assistant. Help users create invoices.
+    # Check current invoice status
+    invoice_meta = st.session_state.invoice_meta
+    invoice_items = st.session_state.invoice
+    chat_stage = st.session_state.chat_stage
     
-    Available:
-    Projects: {', '.join([p[1] for p in projects[:3]]) if projects else 'None'}
-    Parties: {', '.join([p['name'] for p in parties[:3]]) if parties else 'None'}
-    Products: {', '.join(products[:3]) if products else 'None'}
-    
-    Steps:
-    1. Select project
-    2. Select party (with address, pincode, GST info)
-    3. Select invoice type
-    4. Add products
-    5. Generate invoice with GST calculation
-    
-    Be friendly and helpful. Keep responses short."""
-    
+    # Build system prompt with current context
+    system_prompt = f"""You are a helpful invoice assistant. Help users create, manage, and view invoices with GST calculation.
+
+CURRENT CONTEXT:
+- Current Project: {invoice_meta.get('project_name', 'Not selected')}
+- Current Party: {invoice_meta.get('party_name', 'Not selected')}
+- Current Invoice Type: {invoice_meta.get('invoice_type', 'Not selected')}
+- Items in Invoice: {len(invoice_items)} items
+- Current Stage: {chat_stage if chat_stage else 'Normal chat'}
+
+AVAILABLE DATA:
+- Projects: {', '.join([p[1] for p in projects[:5]]) if projects else 'None'}
+- Parties: {', '.join([p.get('name', 'Unknown') for p in parties[:5]]) if parties else 'None'}
+- Products: {', '.join(products[:10]) if products else 'None'}
+
+CAPABILITIES:
+1. Invoice Creation: 'generate invoice' → select project → select party → select type → add products → generate
+2. Product Management: Add products with quantity, price, UOM (kg, liter, nos, etc.)
+3. Price Comparison: Compare user's price with database price and suggest updates
+4. Stock Management: Check stock availability, update stock levels
+5. GST Calculation: Automatic GST based on pincode (CGST+SGST for Tamil Nadu, IGST for others)
+6. Invoice Viewing: View old invoices by number, list all invoices
+7. Database Updates: Update product prices, quantities, UOM in both invoice and database
+
+INVOICE NUMBER FORMAT:
+- New format: ICE/2025-2026/[TYPE]/[SEQUENCE]
+- Types: INV (sales), PI (purchase), PO (purchase order), CN (credit), DN (debit), DCH (delivery challan)
+
+COMMAND EXAMPLES:
+- "generate invoice" - Start new invoice
+- "add 10 pen at ₹50" - Add product
+- "check stock pen" - Check stock
+- "view invoice ICE/25-26/INV/0018" - View old invoice
+- "update pen price to ₹55" - Update price
+- "change quantity to 20" - Update quantity
+- "list invoices" - List all invoices
+
+GST INFORMATION:
+- Tamil Nadu (pincodes 60-64): CGST 9% + SGST 9% = 18%
+- Other states: IGST 18%
+
+RESPONSE GUIDELINES:
+1. Be concise and helpful
+2. Include relevant database information when applicable
+3. Suggest next steps
+4. If user mentions price, compare with database
+5. If stock is insufficient, warn the user
+6. Use emojis for better readability
+7. Format numbers with commas (₹1,000.50)
+
+KEEP RESPONSES UNDER 200 WORDS."""
+
+    # Prepare messages with context
     messages = [
         {"role": "system", "content": system_prompt},
-        *context_history[-4:],
+        *context_history[-6:],  # Last 6 messages for context
         {"role": "user", "content": user_message}
     ]
     
     try:
         response = client.chat.completions.create(
-            model="gpt-3.5-turbo",
+            model="gpt-3.5-turbo",  # or "gpt-4" if you have access
             messages=messages,
-            max_tokens=100,
-            temperature=0.7
+            max_tokens=300,
+            temperature=0.7,
+            presence_penalty=0.3,
+            frequency_penalty=0.2
         )
-        return response.choices[0].message.content
-    except:
-        return "I can help you create invoices. What do you need?"
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        print(f"OpenAI API Error: {e}")
+        # Fallback response
+        return "I can help you with invoices. What do you need?"
 
 def check_product_exists_with_id(product_name):
     """Check if product exists in database and return id, price, stock"""
@@ -5978,6 +6235,21 @@ def update_product_uom_simple(product_name, new_uom):
 def chat_engine(user_text):
     text = user_text.lower().strip()
 
+
+    # ===========================================
+    # AI CONTEXT UPDATE
+    # ===========================================
+    # Add user message to AI context
+    st.session_state.ai_context.append({"role": "user", "content": user_text})
+    
+    # Try AI response first for complex queries
+    if len(user_text.split()) > 3:  # Only use AI for longer queries
+        ai_response = get_ai_response(user_text, st.session_state.ai_context)
+        # Check if AI response is just generic
+        if "invoice" in ai_response.lower() or "stock" in ai_response.lower() or "price" in ai_response.lower():
+            st.session_state.ai_context.append({"role": "assistant", "content": ai_response})
+            return ai_response
+
     # Initialize uom variable at the start
     uom = 'nos'
     
@@ -6098,6 +6370,249 @@ def chat_engine(user_text):
     product, qty, price, extracted_uom = extract_product_qty_price(user_text)
     if extracted_uom:
         uom = extracted_uom 
+
+
+    # ===========================================
+    # SMART SUGGESTIONS COMMAND
+    # ===========================================
+    if text.startswith("suggest") or text == "check issues" or text == "auto fix":
+        if not st.session_state.invoice:
+            return "❌ No items in invoice to analyze"
+        
+        suggestions = []
+        critical_issues = []
+        warnings = []
+        recommendations = []
+        
+        for item in st.session_state.invoice:
+            product = item["item_description"]
+            qty = item.get("qty", 0)
+            price = item.get("supply_rate", 0)
+            uom = item.get("uom", "nos")
+            
+            # 1. Check database price mismatch
+            exists, db_price, stock = check_product_exists_simple(product)
+            if exists and db_price:
+                price_diff = ((price - db_price) / db_price) * 100
+                
+                if abs(price_diff) > 50:  # Critical: >50% difference
+                    if price_diff > 0:
+                        critical_issues.append(f"🚨 **{product}**: Price is {price_diff:.0f}% HIGHER than database (₹{price} vs ₹{db_price})")
+                        suggestions.append(f"• 'update price {product} to {db_price}' - Match database price")
+                    else:
+                        critical_issues.append(f"🚨 **{product}**: Price is {abs(price_diff):.0f}% LOWER than database (₹{price} vs ₹{db_price})")
+                        suggestions.append(f"• 'update price {product} to {db_price}' - Match database price")
+                
+                elif abs(price_diff) > 20:  # Warning: >20% difference
+                    if price_diff > 0:
+                        warnings.append(f"⚠️ **{product}**: Price is {price_diff:.0f}% higher than database")
+                        suggestions.append(f"• 'update price {product} to {round(price*0.8)}' - Reduce by 20%")
+                    else:
+                        warnings.append(f"⚠️ **{product}**: Price is {abs(price_diff):.0f}% lower than database")
+                        suggestions.append(f"• 'update price {product} to {round(price*1.2)}' - Increase by 20%")
+            
+            # 2. Check stock availability
+            if stock is not None and qty > stock:
+                shortage = qty - stock
+                critical_issues.append(f"🚨 **{product}**: INSUFFICIENT STOCK! Need {qty}, have {stock} (shortage: {shortage})")
+                suggestions.append(f"• 'update quantity {product} to {stock}' - Reduce to available stock")
+                suggestions.append(f"• 'add stock {product} by {shortage}' - Increase stock")
+            
+            # 3. Check UOM standardization
+            common_uoms = {"kg", "g", "l", "ml", "m", "cm", "mm", "nos", "box", "pack", "piece", "pcs", "pc", "bottle", "can", "packet"}
+            if uom not in common_uoms:
+                warnings.append(f"⚠️ **{product}**: Non-standard UOM '{uom}' detected")
+                suggestions.append(f"• 'update uom {product} to nos' - Standardize to 'nos'")
+            
+            # 4. Check quantity rounding (suggest round numbers)
+            if qty % 1 != 0:  # Decimal quantity
+                recommendations.append(f"💡 **{product}**: Quantity {qty} has decimals")
+                suggestions.append(f"• 'update quantity {product} to {round(qty)}' - Round quantity")
+            
+            # 5. Check price rounding (suggest nice numbers)
+            if price % 10 != 0 and price > 10:  # Not a round number
+                rounded_50 = round(price/50)*50
+                rounded_100 = round(price/100)*100
+                recommendations.append(f"💡 **{product}**: Price ₹{price} not rounded")
+                suggestions.append(f"• 'update price {product} to {rounded_50}' - Round to nearest 50")
+                suggestions.append(f"• 'update price {product} to {rounded_100}' - Round to nearest 100")
+            
+            # 6. Check for very low/high quantities
+            if qty < 1:
+                warnings.append(f"⚠️ **{product}**: Very low quantity ({qty})")
+                suggestions.append(f"• 'update quantity {product} to 1' - Set to minimum 1")
+            
+            # 7. Check for zero price
+            if price <= 0:
+                critical_issues.append(f"🚨 **{product}**: ZERO or NEGATIVE price (₹{price})")
+                suggestions.append(f"• 'update price {product} to 10' - Set minimum price")
+        
+        # 8. Check for duplicate products in invoice
+        product_counts = {}
+        for item in st.session_state.invoice:
+            product = item["item_description"].lower()
+            product_counts[product] = product_counts.get(product, 0) + 1
+        
+        for product, count in product_counts.items():
+            if count > 1:
+                warnings.append(f"⚠️ **{product.title()}**: Appears {count} times in invoice")
+                suggestions.append(f"• 'merge {product}' - Combine duplicate entries")
+        
+        # Store suggestions for quick apply
+        st.session_state.last_suggestions = suggestions[:10]  # Store top 10
+        
+        # Build response
+        response = "🔍 **SMART ANALYSIS REPORT**\n\n"
+        
+        if critical_issues:
+            response += "🚨 **CRITICAL ISSUES:**\n"
+            response += "\n".join(critical_issues[:3]) + "\n\n"
+        
+        if warnings:
+            response += "⚠️ **WARNINGS:**\n"
+            response += "\n".join(warnings[:5]) + "\n\n"
+        
+        if recommendations:
+            response += "💡 **RECOMMENDATIONS:**\n"
+            response += "\n".join(recommendations[:5]) + "\n\n"
+        
+        if suggestions:
+            response += "🔄 **SUGGESTED ACTIONS:**\n"
+            # Group suggestions by type
+            price_suggestions = [s for s in suggestions if "update price" in s]
+            qty_suggestions = [s for s in suggestions if "update quantity" in s]
+            uom_suggestions = [s for s in suggestions if "update uom" in s]
+            stock_suggestions = [s for s in suggestions if "add stock" in s]
+            
+            if price_suggestions:
+                response += "\n**Price Updates:**\n"
+                response += "\n".join(price_suggestions[:3]) + "\n"
+            
+            if qty_suggestions:
+                response += "\n**Quantity Updates:**\n"
+                response += "\n".join(qty_suggestions[:3]) + "\n"
+            
+            if uom_suggestions:
+                response += "\n**UOM Updates:**\n"
+                response += "\n".join(uom_suggestions[:2]) + "\n"
+            
+            if stock_suggestions:
+                response += "\n**Stock Updates:**\n"
+                response += "\n".join(stock_suggestions[:2]) + "\n"
+            
+            response += "\n📝 **Quick apply:** Type 'apply fix 1' or 'fix all prices'"
+        
+        if not (critical_issues or warnings or recommendations):
+            response += "✅ **Excellent!** No issues detected in your invoice.\n"
+            response += "Everything looks good! 🎉"
+        
+        return response
+
+    # ===========================================
+    # APPLY SUGGESTIONS COMMAND
+    # ===========================================
+    if text.startswith("apply fix") or text.startswith("fix"):
+        if not st.session_state.last_suggestions:
+            return "❌ No suggestions available. Run 'suggest' first."
+        
+        # Check for specific fixes
+        if "all prices" in text:
+            # Apply all price fixes
+            applied = []
+            for suggestion in st.session_state.last_suggestions:
+                if "update price" in suggestion:
+                    # Extract product and price from suggestion
+                    match = re.search(r"update price (.+?) to (\d+)", suggestion)
+                    if match:
+                        product = match.group(1)
+                        new_price = float(match.group(2))
+                        update_product_all_with_history(product, price=new_price)
+                        applied.append(product)
+            
+            if applied:
+                return f"✅ **Applied price fixes to:** {', '.join(applied[:5])}"
+            else:
+                return "❌ No price fixes to apply"
+        
+        elif "all quantities" in text:
+            # Apply all quantity fixes
+            applied = []
+            for suggestion in st.session_state.last_suggestions:
+                if "update quantity" in suggestion:
+                    match = re.search(r"update quantity (.+?) to (\d+)", suggestion)
+                    if match:
+                        product = match.group(1)
+                        new_qty = float(match.group(2))
+                        update_product_all_with_history(product, quantity=new_qty)
+                        applied.append(product)
+            
+            if applied:
+                return f"✅ **Applied quantity fixes to:** {', '.join(applied[:5])}"
+            else:
+                return "❌ No quantity fixes to apply"
+        
+        elif "all" in text:
+            # Apply all fixes
+            applied = []
+            for suggestion in st.session_state.last_suggestions[:5]:  # Limit to 5
+                if "update price" in suggestion:
+                    match = re.search(r"update price (.+?) to (\d+)", suggestion)
+                    if match:
+                        product = match.group(1)
+                        new_price = float(match.group(2))
+                        update_product_all_with_history(product, price=new_price)
+                        applied.append(f"{product} price")
+                
+                elif "update quantity" in suggestion:
+                    match = re.search(r"update quantity (.+?) to (\d+)", suggestion)
+                    if match:
+                        product = match.group(1)
+                        new_qty = float(match.group(2))
+                        update_product_all_with_history(product, quantity=new_qty)
+                        applied.append(f"{product} qty")
+            
+            if applied:
+                return f"✅ **Applied fixes:** {', '.join(applied)}"
+            else:
+                return "❌ No fixes to apply"
+        
+        # Apply specific fix by number
+        elif text.replace("apply fix", "").strip().isdigit():
+            fix_num = int(text.replace("apply fix", "").strip())
+            if 1 <= fix_num <= len(st.session_state.last_suggestions):
+                suggestion = st.session_state.last_suggestions[fix_num-1]
+                
+                # Parse and apply the suggestion
+                if "update price" in suggestion:
+                    match = re.search(r"update price (.+?) to (\d+)", suggestion)
+                    if match:
+                        product = match.group(1)
+                        new_price = float(match.group(2))
+                        update_product_all_with_history(product, price=new_price)
+                        return f"✅ **Applied:** {suggestion}"
+                
+                elif "update quantity" in suggestion:
+                    match = re.search(r"update quantity (.+?) to (\d+)", suggestion)
+                    if match:
+                        product = match.group(1)
+                        new_qty = float(match.group(2))
+                        update_product_all_with_history(product, quantity=new_qty)
+                        return f"✅ **Applied:** {suggestion}"
+                
+                elif "update uom" in suggestion:
+                    match = re.search(r"update uom (.+?) to (\w+)", suggestion)
+                    if match:
+                        product = match.group(1)
+                        new_uom = match.group(2)
+                        update_product_all_with_history(product, uom=new_uom)
+                        return f"✅ **Applied:** {suggestion}"
+                
+                elif "add stock" in suggestion:
+                    return f"ℹ️ **Stock update required:** {suggestion}\nType this command to add stock."
+            
+            return f"❌ Fix number {fix_num} not found"
+        
+        return "❌ Specify what to fix. Examples:\n• 'apply fix 1' - Apply fix #1\n• 'fix all prices' - Fix all prices\n• 'fix all quantities' - Fix all quantities\n• 'fix all' - Apply all fixes"    
 
 
     # ===========================================
@@ -6416,7 +6931,182 @@ def chat_engine(user_text):
 
     
 
+    # ===========================================
+    # QUICK SHORTCUTS COMMAND
+    # ===========================================
+    if text in ["shortcuts", "quick help", "fast"]:
+        response = "⚡ **QUICK SHORTCUTS**\n\n"
+        response += "**One-word commands (when items in invoice):**\n"
+        response += "• '**double**' - Double quantity of first item\n"
+        response += "• '**half**' - Halve quantity of first item\n"
+        response += "• '**+10%**' - Increase price by 10%\n"
+        response += "• '**-10%**' - Decrease price by 10%\n"
+        response += "• '**round50**' - Round price to nearest ₹50\n"
+        response += "• '**round100**' - Round price to nearest ₹100\n"
+        response += "• '**standard**' - Set UOM to 'nos'\n"
+        response += "• '**min1**' - Set quantity to minimum 1\n"
+        response += "\n**Batch operations:**\n"
+        response += "• '**all +10%**' - Increase ALL prices by 10%\n"
+        response += "• '**all double**' - Double ALL quantities\n"
+        response += "• '**all round50**' - Round ALL prices to ₹50\n"
+        response += "\n**Utility commands:**\n"
+        response += "• '**undo**' or '**ctrl+z**' - Undo last change\n"
+        response += "• '**suggest**' - Check for issues\n"
+        response += "• '**history**' - Show change history\n"
+        return response
 
+    # ===========================================
+    # ONE-WORD QUICK ACTIONS
+    # ===========================================
+    if st.session_state.invoice:
+        # Store current product for quick actions
+        if not st.session_state.quick_action_product:
+            st.session_state.quick_action_product = st.session_state.invoice[0]["item_description"]
+        
+        current_product = st.session_state.quick_action_product
+        
+        # Find current item values
+        current_item = None
+        for item in st.session_state.invoice:
+            if item["item_description"].lower() == current_product.lower():
+                current_item = item
+                break
+        
+        if current_item:
+            current_qty = current_item.get("qty", 0)
+            current_price = current_item.get("supply_rate", 0)
+            current_uom = current_item.get("uom", "nos")
+            
+            # QUICK ACTIONS
+            if text == "double":
+                new_qty = current_qty * 2
+                update_product_all_with_history(current_product, quantity=new_qty)
+                return f"⚡ **Doubled quantity:** {current_product}\n{current_qty} → {new_qty}"
+            
+            elif text == "half":
+                new_qty = max(1, current_qty / 2)  # Minimum 1
+                update_product_all_with_history(current_product, quantity=new_qty)
+                return f"⚡ **Halved quantity:** {current_product}\n{current_qty} → {new_qty}"
+            
+            elif text == "+10%" or text == "10% up":
+                new_price = round(current_price * 1.1, 2)
+                update_product_all_with_history(current_product, price=new_price)
+                return f"⚡ **Price +10%:** {current_product}\n₹{current_price} → ₹{new_price}"
+            
+            elif text == "-10%" or text == "10% down":
+                new_price = round(current_price * 0.9, 2)
+                update_product_all_with_history(current_product, price=new_price)
+                return f"⚡ **Price -10%:** {current_product}\n₹{current_price} → ₹{new_price}"
+            
+            elif text == "round50":
+                new_price = round(current_price / 50) * 50
+                update_product_all_with_history(current_product, price=new_price)
+                return f"⚡ **Rounded to ₹50:** {current_product}\n₹{current_price} → ₹{new_price}"
+            
+            elif text == "round100":
+                new_price = round(current_price / 100) * 100
+                update_product_all_with_history(current_product, price=new_price)
+                return f"⚡ **Rounded to ₹100:** {current_product}\n₹{current_price} → ₹{new_price}"
+            
+            elif text == "standard":
+                if current_uom != "nos":
+                    update_product_all_with_history(current_product, uom="nos")
+                    return f"⚡ **Standardized UOM:** {current_product}\n{current_uom} → nos"
+                else:
+                    return f"✅ {current_product} already has standard UOM (nos)"
+            
+            elif text == "min1":
+                if current_qty < 1:
+                    update_product_all_with_history(current_product, quantity=1)
+                    return f"⚡ **Set minimum quantity:** {current_product}\n{current_qty} → 1"
+                else:
+                    return f"✅ {current_product} quantity is already ≥1"
+            
+            # BATCH OPERATIONS
+            elif text == "all +10%":
+                updates = []
+                for item in st.session_state.invoice:
+                    product = item["item_description"]
+                    old_price = item.get("supply_rate", 0)
+                    new_price = round(old_price * 1.1, 2)
+                    update_product_all_with_history(product, price=new_price)
+                    updates.append(f"• {product}: ₹{old_price} → ₹{new_price}")
+                
+                return f"⚡ **All prices +10%:**\n\n" + "\n".join(updates[:5])
+            
+            elif text == "all double":
+                updates = []
+                for item in st.session_state.invoice:
+                    product = item["item_description"]
+                    old_qty = item.get("qty", 0)
+                    new_qty = old_qty * 2
+                    update_product_all_with_history(product, quantity=new_qty)
+                    updates.append(f"• {product}: {old_qty} → {new_qty}")
+                
+                return f"⚡ **All quantities doubled:**\n\n" + "\n".join(updates[:5])
+            
+            elif text == "all round50":
+                updates = []
+                for item in st.session_state.invoice:
+                    product = item["item_description"]
+                    old_price = item.get("supply_rate", 0)
+                    new_price = round(old_price / 50) * 50
+                    update_product_all_with_history(product, price=new_price)
+                    updates.append(f"• {product}: ₹{old_price} → ₹{new_price}")
+                
+                return f"⚡ **All prices rounded to ₹50:**\n\n" + "\n".join(updates[:5])
+
+    # ===========================================
+    # UNDO COMMAND
+    # ===========================================
+    if text in ["undo", "ctrl+z", "go back", "revert"]:
+        product, message = undo_last_change()
+        if product:
+            # Calculate new subtotal
+            subtotal = 0
+            for item in st.session_state.invoice:
+                qty_val = item.get("qty")
+                price_val = item.get("supply_rate")
+                if qty_val is not None and price_val is not None:
+                    try:
+                        subtotal += float(qty_val) * float(price_val)
+                    except (ValueError, TypeError):
+                        continue
+            
+            response = f"{message}\n\n"
+            response += f"💰 **Updated Invoice Subtotal:** ₹{subtotal:,.2f}\n\n"
+            response += f"🔄 **Remaining undo history:** {len(st.session_state.change_history)} changes"
+            return response
+        else:
+            return message
+
+    # ===========================================
+    # HISTORY COMMAND
+    # ===========================================
+    if text in ["history", "changes", "what did i do"]:
+        if not st.session_state.change_history:
+            return "📜 **No change history**\n\nNo changes have been made yet."
+        
+        response = "📜 **CHANGE HISTORY** (Last 10 changes)\n\n"
+        
+        for i, change in enumerate(reversed(st.session_state.change_history[-10:]), 1):
+            time_ago = (datetime.now() - change["timestamp"]).seconds
+            mins_ago = time_ago // 60
+            secs_ago = time_ago % 60
+            
+            if change["type"] == "price":
+                response += f"{i}. **{change['product']}**: Price ₹{change['old']} → ₹{change['new']} ({mins_ago}m ago)\n"
+            elif change["type"] == "quantity":
+                response += f"{i}. **{change['product']}**: Quantity {change['old']} → {change['new']} ({mins_ago}m ago)\n"
+            elif change["type"] == "uom":
+                response += f"{i}. **{change['product']}**: UOM {change['old']} → {change['new']} ({mins_ago}m ago)\n"
+            elif change["type"] == "product_added":
+                response += f"{i}. **{change['product']}**: Added to invoice ({mins_ago}m ago)\n"
+        
+        response += f"\n🔄 **Total changes:** {len(st.session_state.change_history)}\n"
+        response += "💡 Type 'undo' to revert last change"
+        
+        return response 
 
     # ===========================================
     # NEW: DELETE ROW COMMAND
@@ -7872,6 +8562,14 @@ def chat_engine(user_text):
         except (ValueError, TypeError):
             price_float = None
 
+    # Check if product exists in database - THIS IS THE CRITICAL LINE THAT WAS MISSING
+    if product:
+        exists, db_price, stock = check_product_exists_simple(product)
+    else:
+        exists = False
+        db_price = None
+        stock = None
+
     if not exists:
         if qty is None:
             st.session_state.chat_stage = "ASK_QTY"
@@ -7963,10 +8661,7 @@ def chat_engine(user_text):
             response += f"Database price: ₹{db_price_float:,.2f}\n"
             response += f"({price_diff:.1f}% higher)\n\n"
             response += "Update database to new price? (update/use db)"
-            st.session_state.chat_stage = "PRICE_ALERT_SMALL_HIGH"
-        
-        return response
-
+            return response
 
     # If prices are equal or db_price_float is None, proceed with adding item
     # Check stock before adding
@@ -8754,6 +9449,15 @@ if not st.session_state.messages:
         greeting += "• '**update quantity pen to 20**' - Change quantity in invoice & check stock\n"
         greeting += "• '**update price screwdriver to ₹75**' - Change price in invoice & database\n"
         greeting += "• '**update all pen to 20 pieces at ₹30**' - Update all at once\n\n"
+        greeting += "**⚡ Quick Shortcuts:**\n"
+        greeting += "• '**double**', '**half**' - Adjust quantities\n"
+        greeting += "• '**+10%**', '**-10%**' - Adjust prices\n"
+        greeting += "• '**round50**', '**round100**' - Round prices\n"
+        greeting += "• '**all +10%**' - Apply to ALL items\n"
+        greeting += "• '**suggest**' - Auto-detect issues\n"
+        greeting += "• '**undo**' or '**ctrl+z**' - Undo last change\n"
+        greeting += "• '**history**' - View change history\n"
+        greeting += "• '**shortcuts**' - Show all quick commands\n\n"
         
         st.markdown(greeting)
         st.session_state.messages.append({
